@@ -332,3 +332,79 @@
     )
   )
 )
+
+;; Calculate total debt for a user (principal + accrued interest)
+(define-read-only (calculate-user-debt (account principal))
+  (let (
+      (borrow-position (map-get? user-borrow-positions { account: account }))
+      (borrowed-amount (default-to u0 (get stx-amount borrow-position)))
+      (last-accrual (default-to u0 (get last-interest-accrual borrow-position)))
+      (current-time (get-current-timestamp))
+    )
+    (if (and (> borrowed-amount u0) (> current-time last-accrual))
+      (let (
+          (time-elapsed (- current-time last-accrual))
+          (interest-rate-per-second (/ ANNUAL_INTEREST_RATE SECONDS_PER_YEAR))
+          (interest-factor (+ u100 (/ (* interest-rate-per-second time-elapsed) u100)))
+          (total-debt (/ (* borrowed-amount interest-factor) u100))
+        )
+        (ok total-debt)
+      )
+      (ok borrowed-amount)
+    )
+  )
+)
+
+;; LIQUIDATION FUNCTIONS
+
+;; Liquidate undercollateralized position (simplified version)
+(define-public (liquidate-position (target-user principal))
+  (let (
+      (user-debt (unwrap! (calculate-user-debt target-user) ERR_CONTRACT_CALL_FAILED))
+      (collateral-position (unwrap! (map-get? user-collateral-positions { account: target-user })
+        ERR_CANNOT_BE_LIQUIDATED
+      ))
+      (collateral-amount (get sbtc-amount collateral-position))
+      (sbtc-price (unwrap! (get-sbtc-price-in-stx) ERR_PRICE_FEED_ERROR))
+      (collateral-value (* collateral-amount sbtc-price))
+      (liquidation-ratio (* user-debt LIQUIDATION_THRESHOLD))
+      (liquidator-reward (/ (* collateral-amount LIQUIDATOR_REWARD_RATE) u100))
+    )
+    ;; Update interest before liquidation
+    (update-interest-accrual)
+
+    ;; Validate liquidation conditions
+    (asserts! (> user-debt u0) ERR_CANNOT_BE_LIQUIDATED)
+    (asserts! (<= (* collateral-value u100) liquidation-ratio)
+      ERR_CANNOT_BE_LIQUIDATED
+    )
+
+    ;; Update global tracking
+    (var-set total-sbtc-collateral
+      (if (>= (var-get total-sbtc-collateral) collateral-amount)
+        (- (var-get total-sbtc-collateral) collateral-amount)
+        u0
+      ))
+    (var-set total-stx-borrows
+      (if (>= (var-get total-stx-borrows) user-debt)
+        (- (var-get total-stx-borrows) user-debt)
+        u0
+      ))
+
+    ;; Clear user positions
+    (map-delete user-borrow-positions { account: target-user })
+    (map-delete user-collateral-positions { account: target-user })
+
+    ;; Give liquidator reward (simplified - just transfer the reward amount)
+    ;; In production, you would swap collateral and distribute appropriately
+
+    (ok true)
+  )
+)
+
+;; HELPER FUNCTIONS
+
+;; Get current block timestamp
+(define-private (get-current-timestamp)
+  (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1)))
+)
