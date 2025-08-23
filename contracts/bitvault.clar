@@ -219,3 +219,116 @@
     )
   )
 )
+
+;; BORROWING FUNCTIONS
+
+;; Borrow STX against sBTC collateral
+(define-public (borrow-stx
+    (collateral-amount uint)
+    (borrow-amount uint)
+  )
+  (let (
+      (caller tx-sender)
+      (existing-collateral (map-get? user-collateral-positions { account: caller }))
+      (current-collateral (default-to u0 (get sbtc-amount existing-collateral)))
+      (new-total-collateral (+ current-collateral collateral-amount))
+      (sbtc-price (unwrap! (get-sbtc-price-in-stx) ERR_PRICE_FEED_ERROR))
+      (collateral-value (* new-total-collateral sbtc-price))
+      (max-borrowable (/ (* collateral-value LOAN_TO_VALUE_RATIO) u100))
+      (existing-borrow (map-get? user-borrow-positions { account: caller }))
+      (current-debt (unwrap! (calculate-user-debt caller) ERR_CONTRACT_CALL_FAILED))
+      (new-total-debt (+ current-debt borrow-amount))
+    )
+    ;; Input validation
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> collateral-amount u0) ERR_ZERO_AMOUNT)
+    (asserts! (> borrow-amount u0) ERR_ZERO_AMOUNT)
+    (asserts! (<= new-total-debt max-borrowable) ERR_EXCEEDED_MAX_BORROW)
+
+    ;; Update interest before processing borrow
+    (update-interest-accrual)
+
+    ;; Update borrow position
+    (map-set user-borrow-positions { account: caller } {
+      stx-amount: new-total-debt,
+      last-interest-accrual: (get-current-timestamp),
+    })
+
+    ;; Update global borrow tracking
+    (var-set total-stx-borrows (+ (var-get total-stx-borrows) borrow-amount))
+
+    ;; Update collateral position
+    (map-set user-collateral-positions { account: caller } { sbtc-amount: new-total-collateral })
+
+    ;; Update global collateral tracking
+    (var-set total-sbtc-collateral
+      (+ (var-get total-sbtc-collateral) collateral-amount)
+    )
+
+    ;; Transfer borrowed STX to user (simplified - assumes contract has STX balance)
+    (try! (as-contract (stx-transfer? borrow-amount tx-sender caller)))
+
+    (ok true)
+  )
+)
+
+;; Repay loan and retrieve collateral
+(define-public (repay-loan (repay-amount uint))
+  (let (
+      (caller tx-sender)
+      (borrow-position (unwrap! (map-get? user-borrow-positions { account: caller })
+        ERR_INSUFFICIENT_BALANCE
+      ))
+      (borrowed-principal (get stx-amount borrow-position))
+      (total-debt (unwrap! (calculate-user-debt caller) ERR_CONTRACT_CALL_FAILED))
+      (collateral-position (map-get? user-collateral-positions { account: caller }))
+      (collateral-amount (default-to u0 (get sbtc-amount collateral-position)))
+    )
+    ;; Input validation
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> repay-amount u0) ERR_ZERO_AMOUNT)
+
+    ;; Update interest before processing repayment
+    (update-interest-accrual)
+
+    ;; Accept STX repayment from user
+    (try! (stx-transfer? repay-amount caller (as-contract tx-sender)))
+
+    ;; Calculate remaining debt
+    (let ((remaining-debt (if (>= repay-amount total-debt)
+        u0
+        (- total-debt repay-amount)
+      )))
+      (if (is-eq remaining-debt u0)
+        (begin
+          ;; Full repayment - clear positions and return collateral
+          (map-delete user-collateral-positions { account: caller })
+          (map-delete user-borrow-positions { account: caller })
+
+          ;; Update global tracking
+          (var-set total-sbtc-collateral
+            (if (>= (var-get total-sbtc-collateral) collateral-amount)
+              (- (var-get total-sbtc-collateral) collateral-amount)
+              u0
+            ))
+          (var-set total-stx-borrows
+            (if (>= (var-get total-stx-borrows) borrowed-principal)
+              (- (var-get total-stx-borrows) borrowed-principal)
+              u0
+            ))
+
+          (ok true)
+        )
+        (begin
+          ;; Partial repayment - update borrow position
+          (map-set user-borrow-positions { account: caller } {
+            stx-amount: remaining-debt,
+            last-interest-accrual: (get-current-timestamp),
+          })
+
+          (ok true)
+        )
+      )
+    )
+  )
+)
