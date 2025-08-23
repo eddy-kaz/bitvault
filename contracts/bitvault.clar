@@ -408,3 +408,81 @@
 (define-private (get-current-timestamp)
   (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1)))
 )
+
+;; Update global interest accrual for lenders
+(define-private (update-interest-accrual)
+  (let (
+      (current-time (get-current-timestamp))
+      (last-update (var-get last-interest-update))
+    )
+    (if (and (> current-time last-update) (> (var-get total-stx-deposits) u0))
+      (let (
+          (time-elapsed (- current-time last-update))
+          (total-borrows (var-get total-stx-borrows))
+          (total-deposits (var-get total-stx-deposits))
+          (interest-earned (* (* total-borrows ANNUAL_INTEREST_RATE)
+            (/ time-elapsed SECONDS_PER_YEAR)
+          ))
+          (yield-per-token (/ (* interest-earned BASIS_POINTS) total-deposits))
+        )
+        ;; Update timestamp and yield index
+        (var-set last-interest-update current-time)
+        (var-set cumulative-yield-index
+          (+ (var-get cumulative-yield-index) yield-per-token)
+        )
+        true
+      )
+      true
+    )
+  )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Get user's collateral balance
+(define-read-only (get-user-collateral (account principal))
+  (default-to u0
+    (get sbtc-amount (map-get? user-collateral-positions { account: account }))
+  )
+)
+
+;; Get user's deposit balance
+(define-read-only (get-user-deposits (account principal))
+  (default-to u0
+    (get stx-amount (map-get? user-deposit-positions { account: account }))
+  )
+)
+
+;; Get user's borrow balance
+(define-read-only (get-user-borrows (account principal))
+  (default-to u0
+    (get stx-amount (map-get? user-borrow-positions { account: account }))
+  )
+)
+
+;; Get user's health factor
+(define-read-only (get-user-health-factor (account principal))
+  (let (
+      (collateral-amount (get-user-collateral account))
+      (debt-amount (unwrap! (calculate-user-debt account) (ok u0)))
+      (sbtc-price (unwrap! (get-sbtc-price-in-stx) (ok u0)))
+      (collateral-value (* collateral-amount sbtc-price))
+    )
+    (if (is-eq debt-amount u0)
+      (ok u999999) ;; Very high health factor if no debt
+      (ok (/ (* collateral-value u100) debt-amount))
+    )
+  )
+)
+
+;; Get protocol statistics
+(define-read-only (get-protocol-stats)
+  {
+    total-sbtc-collateral: (var-get total-sbtc-collateral),
+    total-stx-deposits: (var-get total-stx-deposits),
+    total-stx-borrows: (var-get total-stx-borrows),
+    cumulative-yield-index: (var-get cumulative-yield-index),
+    current-sbtc-price: (var-get sbtc-price-in-stx),
+    protocol-paused: (var-get protocol-paused),
+  }
+)
